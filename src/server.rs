@@ -469,7 +469,20 @@ impl Peer {
                         .await?
                 };
                 let md = metadata(&res.headers);
-                let mut first = true;
+                // A response can signal subscription readiness before its first item.
+                // H is a sequenced, payload-free frame and consumes no message credit.
+                let mut first = md.entries.is_empty();
+                if !first {
+                    let seq = call.seq.get();
+                    let mut header = peer.reply(call.sid, seq, 0);
+                    call.seq.set(
+                        seq.checked_add(1).ok_or_else(|| {
+                            ConnectError::resource_exhausted("sequence exhausted")
+                        })?,
+                    );
+                    header.header = md.clone().into();
+                    peer.write(header);
+                }
                 while let Some(item) = res.body.next().await {
                     let bytes = item?;
                     let wait = async {
