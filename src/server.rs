@@ -8,6 +8,7 @@ use connectrpc::{CodecFormat, ConnectError, Dispatcher, MethodKind, Payload, Req
 use event_listener::Event;
 use futures::{
     FutureExt, StreamExt,
+    channel::mpsc,
     future::{AbortHandle, Abortable, LocalBoxFuture},
 };
 use futures_timer::Delay;
@@ -26,6 +27,24 @@ const PING: u32 = 8;
 const WINDOW: u32 = 16;
 const REQUEST: u32 = OPEN | CLOSE;
 const MAX_CALLS: usize = 4096;
+const REQUEST_WINDOW: usize = 16;
+const MAX_REQUEST_BYTES: usize = 4 << 20;
+const PEER_QUEUE_BYTES: usize = 16 << 20;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
+struct Incoming {
+    data: Vec<u8>,
+    size: usize,
+    queued: Arc<AtomicUsize>,
+}
+impl Drop for Incoming {
+    fn drop(&mut self) {
+        self.queued.fetch_sub(self.size, Ordering::Relaxed);
+    }
+}
 
 struct Credit(Cell<Option<u32>>);
 impl Credit {
@@ -45,6 +64,8 @@ impl Credit {
 
 struct Call {
     sid: u32,
+    input: RefCell<Option<mpsc::Sender<Incoming>>>,
+    next_input: Cell<u32>,
     seq: Cell<u32>,
     abort: AbortHandle,
     credit: Credit,
@@ -54,6 +75,7 @@ struct Peer {
     epoch: NonZeroU32,
     client: Cell<Option<NonZeroU32>>,
     closed: Cell<bool>,
+    queued: Arc<AtomicUsize>,
     calls: RefCell<HashMap<u32, Rc<Call>>>,
     credit: Credit,
     changed: Event,
@@ -78,6 +100,7 @@ impl Session {
             client: Cell::new(None),
             closed: Cell::new(false),
             calls: RefCell::default(),
+            queued: Default::default(),
             credit: Credit::new(0),
             changed: Event::new(),
             dispatcher: Rc::new(service),
@@ -243,9 +266,31 @@ impl Peer {
                 call.credit.grant(f.window);
                 self.changed.notify(usize::MAX);
             }
-            CLOSE if f.code.is_some() && f.seq == 2 => {
+            CLOSE if f.code.is_some() && f.seq >= 2 => {
                 self.calls.borrow_mut().remove(&f.sid);
                 call.abort.abort();
+            }
+            0 | CLOSE
+                if f.seq == call.next_input.get()
+                    && call.input.borrow().is_some()
+                    && f.code.is_none() =>
+            {
+                let end = f.flags == CLOSE;
+                let status = match f.payload {
+                    Some(data) => self.enqueue(&call, data),
+                    None if end => Ok(()),
+                    None => Err(ConnectError::invalid_argument("missing stream message")),
+                };
+                if let Err(err) = status {
+                    self.calls.borrow_mut().remove(&f.sid);
+                    call.abort.abort();
+                    self.terminal(f.sid, call.seq.get(), Err(err));
+                } else {
+                    call.next_input.set(f.seq.saturating_add(1));
+                    if end {
+                        call.input.borrow_mut().take();
+                    }
+                }
             }
             PING if f.seq == 0 => {}
             _ => {
@@ -260,6 +305,33 @@ impl Peer {
         }
     }
 
+    fn enqueue(&self, call: &Call, data: Vec<u8>) -> Result<(), ConnectError> {
+        let size = data.capacity();
+        if data.len() > MAX_REQUEST_BYTES
+            || self
+                .queued
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    v.checked_add(size).filter(|n| *n <= PEER_QUEUE_BYTES)
+                })
+                .is_err()
+        {
+            return Err(ConnectError::resource_exhausted(
+                "request stream receive limit",
+            ));
+        }
+        let input = Incoming {
+            data,
+            size,
+            queued: self.queued.clone(),
+        };
+        call.input
+            .borrow_mut()
+            .as_mut()
+            .ok_or_else(|| ConnectError::invalid_argument("request stream is closed"))?
+            .try_send(input)
+            .map_err(|_| ConnectError::resource_exhausted("request receive window exceeded"))
+    }
+
     fn start(self: &Rc<Self>, mut f: Frame) {
         let error = |err| self.terminal(f.sid, 1, Err(err));
         let path = f.method.strip_prefix('/').unwrap_or("");
@@ -267,13 +339,11 @@ impl Peer {
             error(ConnectError::unimplemented("unknown method"));
             return;
         };
-        if !matches!(method.kind, MethodKind::Unary | MethodKind::ServerStreaming) {
-            error(ConnectError::unimplemented(
-                "client streaming is unsupported",
-            ));
-            return;
-        }
-        if f.flags != REQUEST || f.payload.is_none() {
+        let request_stream = matches!(
+            method.kind,
+            MethodKind::ClientStreaming | MethodKind::BidiStreaming
+        );
+        if !request_stream && (f.flags != REQUEST || f.payload.is_none()) {
             error(ConnectError::invalid_argument("expected single request"));
             return;
         }
@@ -313,27 +383,75 @@ impl Peer {
             return;
         }
         let (abort, reg) = AbortHandle::new_pair();
+        let (input, requests) = mpsc::channel(REQUEST_WINDOW - 1);
         let call = Rc::new(Call {
+            input: RefCell::new(request_stream.then_some(input)),
+            next_input: Cell::new(2),
             sid: f.sid,
             seq: Cell::new(1),
             abort,
             credit: Credit::new(f.window),
         });
         self.calls.borrow_mut().insert(f.sid, call.clone());
-        if method.kind == MethodKind::ServerStreaming {
-            self.write(self.reply(f.sid, 1, 0));
+        if request_stream {
+            if let Some(data) = f.payload.take()
+                && let Err(err) = self.enqueue(&call, data)
+            {
+                self.calls.borrow_mut().remove(&f.sid);
+                error(err);
+                return;
+            }
+            if f.flags & CLOSE != 0 {
+                call.input.borrow_mut().take();
+            }
+        }
+        if request_stream || method.kind == MethodKind::ServerStreaming {
+            let mut header = self.reply(f.sid, 1, 0);
+            if request_stream {
+                header.window = REQUEST_WINDOW as u32;
+            }
+            self.write(header);
             call.seq.set(2);
         }
         let peer = self.clone();
         let path = path.to_owned();
         let data = f.payload.take().unwrap_or_default().into();
+        let (consumed, mut grants) = mpsc::unbounded();
+        if request_stream {
+            let weak = Rc::downgrade(self);
+            let sid = f.sid;
+            (self.spawn)(
+                async move {
+                    while grants.next().await.is_some() {
+                        let Some(peer) = weak.upgrade() else { break };
+                        if !peer.calls.borrow().contains_key(&sid) {
+                            break;
+                        }
+                        let mut frame = peer.reply(sid, 0, WINDOW);
+                        frame.window = 1;
+                        peer.write(frame);
+                    }
+                }
+                .boxed_local(),
+            );
+        }
+        let requests: connectrpc::dispatcher::RequestStream =
+            Box::pin(requests.map(move |mut item| {
+                let _ = consumed.unbounded_send(());
+                Ok(std::mem::take(&mut item.data).into())
+            }));
         let work = async move {
             let dispatch = async {
-                if method.kind == MethodKind::Unary {
-                    let res = peer
-                        .dispatcher
-                        .call_unary(&path, ctx, Payload::new(data, format), format)
-                        .await?;
+                if matches!(method.kind, MethodKind::Unary | MethodKind::ClientStreaming) {
+                    let res = if request_stream {
+                        peer.dispatcher
+                            .call_client_streaming(&path, ctx, requests, format)
+                            .await?
+                    } else {
+                        peer.dispatcher
+                            .call_unary(&path, ctx, Payload::new(data, format), format)
+                            .await?
+                    };
                     return Ok(Frame {
                         payload: Some(res.body.to_vec()),
                         header: metadata(&res.headers).into(),
@@ -341,10 +459,15 @@ impl Peer {
                         ..Default::default()
                     });
                 }
-                let mut res = peer
-                    .dispatcher
-                    .call_server_streaming(&path, ctx, data, format)
-                    .await?;
+                let mut res = if request_stream {
+                    peer.dispatcher
+                        .call_bidi_streaming(&path, ctx, requests, format)
+                        .await?
+                } else {
+                    peer.dispatcher
+                        .call_server_streaming(&path, ctx, data, format)
+                        .await?
+                };
                 let md = metadata(&res.headers);
                 let mut first = true;
                 while let Some(item) = res.body.next().await {

@@ -119,3 +119,121 @@ fn client_abort_and_port_close_drop_pending_calls() {
     server.receive(&[]).unwrap();
     pool.run(); // fails to finish if either handler still owns its pending future
 }
+
+#[test]
+fn request_streams_half_close_and_live_responses() {
+    use buffa_types::Timestamp;
+    use connectrpc::{ServiceStream, bidi_streaming_handler_fn, client_streaming_handler_fn};
+    use futures::StreamExt;
+    let mut pool = LocalPool::new();
+    let spawner = pool.spawner();
+    let replies = Rc::new(RefCell::new(Vec::new()));
+    let sink = replies.clone();
+    let router = Router::new()
+        .route_client_stream(
+            "unit.Service",
+            "Sum",
+            client_streaming_handler_fn(|_, mut input: ServiceStream<Timestamp>| async move {
+                let mut n = 0;
+                while let Some(v) = input.next().await {
+                    n += v?.seconds;
+                }
+                Response::ok(Timestamp {
+                    seconds: n,
+                    ..Default::default()
+                })
+            }),
+        )
+        .route_bidi_stream(
+            "unit.Service",
+            "Double",
+            bidi_streaming_handler_fn(|_, input: ServiceStream<Timestamp>| async move {
+                Response::ok(
+                    input
+                        .map(|v| {
+                            v.map(|mut n| {
+                                n.seconds *= 2;
+                                n
+                            })
+                        })
+                        .boxed(),
+                )
+            }),
+        );
+    let server = Session::new(
+        19.try_into().unwrap(),
+        router,
+        move |b| {
+            sink.borrow_mut()
+                .extend(Envelope::decode_from_slice(&b).unwrap().frames)
+        },
+        move |task| spawner.spawn_local(task).unwrap(),
+    );
+    for (sid, method) in [(1, "Sum"), (2, "Double")] {
+        let mut open = request(sid, &format!("/unit.Service/{method}"));
+        open.flags = 1;
+        open.payload = None;
+        send(&server, vec![open]);
+        pool.run_until_stalled();
+        assert!(
+            replies
+                .borrow()
+                .iter()
+                .any(|f| f.sid == sid && f.seq == 1 && f.window > 0)
+        );
+        for i in 1..=35 {
+            send(
+                &server,
+                vec![Frame {
+                    epoch: 7,
+                    sid,
+                    seq: 1 + i,
+                    payload: Some(
+                        Timestamp {
+                            seconds: i as i64,
+                            ..Default::default()
+                        }
+                        .encode_to_vec(),
+                    ),
+                    ..Default::default()
+                }],
+            );
+            pool.run_until_stalled();
+            if sid == 2 {
+                let frames = replies.borrow();
+                assert!(
+                    frames.iter().any(|f| f.sid == 2
+                        && f.payload
+                            .as_ref()
+                            .is_some_and(|b| Timestamp::decode_from_slice(b).unwrap().seconds
+                                == (i * 2) as i64))
+                );
+            }
+        }
+        send(
+            &server,
+            vec![Frame {
+                epoch: 7,
+                sid,
+                seq: 37,
+                flags: 2,
+                ..Default::default()
+            }],
+        );
+        pool.run_until_stalled();
+        let frames = replies.borrow();
+        let last = frames
+            .iter()
+            .find(|f| f.sid == sid && f.flags == 2)
+            .unwrap();
+        assert_eq!(last.code.unwrap_or(0), 0);
+        if sid == 1 {
+            assert_eq!(
+                Timestamp::decode_from_slice(last.payload.as_ref().unwrap())
+                    .unwrap()
+                    .seconds,
+                630
+            );
+        }
+    }
+}

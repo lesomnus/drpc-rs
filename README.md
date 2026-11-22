@@ -5,7 +5,7 @@ The web client uses `dialWorker` from `@lesomnus/grpc-dgram/transport/port` and 
 
 Pass the transferred port, a random nonzero server incarnation, and a Connect Rust dispatcher (such as a registered `Router`) to `PortServer::bind`. Keep the returned handle alive until the port should close. Each handle serves one client incarnation. The native `Session` API accepts an ordered byte sender and a local executor.
 
-The initial server supports unary and server-streaming methods, protobuf and JSON payloads, gRPC status, metadata, per-call timeouts, cancellation and stream/peer credit on a reliable channel. Client-streaming and bidirectional calls receive Unimplemented. Unreliable transports, compression and a Rust client are outside this implementation. The published TypeScript peer used for interoperability is `@lesomnus/grpc-dgram@0.1.0`.
+The server supports unary, server-streaming, client-streaming and bidirectional Connect handlers, protobuf and JSON payloads, gRPC status, metadata, per-call timeouts and cancellation over a reliable channel. Request streams expose messages as they arrive, release receive credit on consumption, and end when the sender half-closes. Per-stream message counts, inbound message sizes and aggregate queued bytes are bounded. Response streams honor stream and peer credit.
 
 ## Development
 
