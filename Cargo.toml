@@ -1,0 +1,27 @@
+[package]
+name = "drpc-rs"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/lesomnus/drpc-rs"
+description = "Serve Connect Rust handlers over reliable dRPC MessagePorts"
+publish = false
+
+[dependencies]
+base64 = "0.22"
+buffa = "=0.8.1"
+buffa-types = "0.8"
+connectrpc = { version = "=0.8.2", default-features = false, features = ["json"] }
+event-listener = "5"
+futures = "0.3"
+futures-timer = { version = "3", features = ["wasm-bindgen"] }
+http = "1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["MessageEvent", "MessagePort"] }
+
+[dev-dependencies]
+buffa-types = { version = "0.8", features = ["json"] }

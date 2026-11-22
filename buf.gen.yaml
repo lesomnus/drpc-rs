@@ -1,0 +1,7 @@
+version: v2
+plugins:
+  - local: protoc-gen-buffa
+    out: src/generated
+  - local: protoc-gen-buffa-packaging
+    out: src/generated
+    strategy: all
